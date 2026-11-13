@@ -15,7 +15,8 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"HTTP_ADDR", "DATABASE_URL", "REDIS_ADDR", "ADMIN_API_KEY",
-		"INGEST_INTERVAL", "CACHE_TTL", "RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
+		"INGEST_INTERVAL", "INGEST_TIMEOUT", "CACHE_TTL", "RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
+		"PROVIDER_PAGE_SIZE", "PROVIDER_MAX_PAGES", "PROVIDER_REQUESTS_PER_SECOND",
 	} {
 		t.Setenv(key, "")
 	}
@@ -30,7 +31,8 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Addr != ":8080" || cfg.IngestInterval != 5*time.Minute || cfg.CacheTTL != time.Minute ||
-		cfg.RateLimitPerMinute != 120 ||
+		cfg.RateLimitPerMinute != 120 || cfg.IngestTimeout != time.Hour ||
+		cfg.ProviderPageSize != 100 || cfg.ProviderMaxPages != 10_000 || cfg.ProviderRequestsPerSecond != 5 ||
 		cfg.RedisAddr != "" || cfg.AdminAPIKey != "" || cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
@@ -72,12 +74,13 @@ func TestLoadReportsEveryMalformedValue(t *testing.T) {
 	t.Setenv("INGEST_INTERVAL", "often")
 	t.Setenv("RATE_LIMIT_PER_MINUTE", "-5")
 	t.Setenv("PROVIDER1_URL", "not a url")
+	t.Setenv("PROVIDER_PAGE_SIZE", "0")
 
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"INGEST_INTERVAL", "RATE_LIMIT_PER_MINUTE", "PROVIDER1_URL"} {
+	for _, key := range []string{"INGEST_INTERVAL", "RATE_LIMIT_PER_MINUTE", "PROVIDER1_URL", "PROVIDER_PAGE_SIZE"} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}

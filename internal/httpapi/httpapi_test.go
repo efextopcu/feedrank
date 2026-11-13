@@ -26,13 +26,19 @@ func (f *fakeSearcher) Search(_ context.Context, q domain.SearchQuery) (domain.S
 	return f.result, true, f.err
 }
 
-type fakeIngester struct{ err error }
+type fakeIngester struct {
+	err    error
+	ctxErr *error // where to record the run context's state, if set
+}
 
-func (f fakeIngester) Run(context.Context) ([]ingest.Result, error) {
+func (f fakeIngester) Run(ctx context.Context) ([]ingest.Result, error) {
+	if f.ctxErr != nil {
+		*f.ctxErr = ctx.Err()
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
-	return []ingest.Result{{Provider: "provider1", Fetched: 4, Changed: 4}}, nil
+	return []ingest.Result{{Provider: "provider1", Pages: 1, Fetched: 4, Changed: 4}}, nil
 }
 
 type fakeLimiter struct {
@@ -165,13 +171,30 @@ func TestIngest(t *testing.T) {
 	}
 
 	rec := do(h, http.MethodPost, "/api/v1/ingest", "X-API-Key", "secret")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"changed":4`) {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"pages":1`) ||
+		!strings.Contains(rec.Body.String(), `"changed":4`) {
 		t.Errorf("status %d, body %s", rec.Code, rec.Body)
 	}
 
 	busy := newTestHandler(Options{AdminAPIKey: "secret", Ingest: fakeIngester{err: ingest.ErrAlreadyRunning}})
 	if rec := do(busy, http.MethodPost, "/api/v1/ingest", "X-API-Key", "secret"); rec.Code != http.StatusConflict {
 		t.Errorf("while running: status %d, want 409", rec.Code)
+	}
+}
+
+// A client that stops waiting must not cancel a run that is half done.
+func TestIngestOutlivesTheRequest(t *testing.T) {
+	var runCtxErr error
+	h := newTestHandler(Options{AdminAPIKey: "secret", Ingest: fakeIngester{ctxErr: &runCtxErr}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/v1/ingest", http.NoBody)
+	req.Header.Set("X-API-Key", "secret")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if runCtxErr != nil {
+		t.Errorf("the run's context was %v; it should not follow the request's", runCtxErr)
 	}
 }
 

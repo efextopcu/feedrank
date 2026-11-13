@@ -259,8 +259,9 @@
                   "  pm.expect(providers.map((p) => p.provider)).to.have.members(['provider1', 'provider2']);",
                   "});",
                   "providers.forEach((p) => {",
-                  "  pm.test(`${p.provider}: fetched ${p.fetched}, rejected ${p.rejected}, changed ${p.changed}`, () => {",
+                  "  pm.test(`${p.provider}: ${p.pages} page(s), fetched ${p.fetched}, rejected ${p.rejected}, changed ${p.changed}`, () => {",
                   "    pm.expect(p.error, p.error).to.be.undefined;",
+                  "    pm.expect(p.pages).to.be.above(0);",
                   "    pm.expect(p.fetched).to.be.above(0);",
                   "    pm.expect(p.changed).to.be.within(0, p.fetched);",
                   "  });",
@@ -289,7 +290,7 @@
                 "ingest"
               ]
             },
-            "description": "Runs ingestion now and reports each provider:\n\n- `fetched`: items that passed validation\n- `rejected`: items left out (unknown type, bad date, negative counter); the server logs why\n- `changed`: rows actually written\n\nUnchanged rows are skipped, so running this again reports `changed: 0` and leaves the search cache alone. A provider that fails is reported with an `error`; the other one is still stored."
+            "description": "Runs ingestion now and reports each provider:\n\n- `pages`: pages fetched and stored, each in its own transaction\n- `fetched`: items that passed validation\n- `rejected`: items left out (unknown type, bad date, negative counter); the server logs why\n- `changed`: rows actually written\n\nUnchanged rows are skipped, so running this again reports `changed: 0` and leaves the search cache alone. A provider that fails part-way is reported with an `error`, and its counts cover the pages stored before it; the other provider is stored regardless. The response comes when the run is over, and a client that stops waiting does not cancel it."
           },
           "response": []
         },

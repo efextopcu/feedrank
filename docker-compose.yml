@@ -39,8 +39,15 @@ services:
       ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key}
       PROVIDER1_URL: ${PROVIDER1_URL:?set PROVIDER1_URL in .env, see .env.example}
       PROVIDER2_URL: ${PROVIDER2_URL:?set PROVIDER2_URL in .env, see .env.example}
-      INGEST_INTERVAL: ${INGEST_INTERVAL:-5m}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Optional tuning from .env; an empty value means the app's default.
+      INGEST_INTERVAL: ${INGEST_INTERVAL:-}
+      INGEST_TIMEOUT: ${INGEST_TIMEOUT:-}
+      PROVIDER_PAGE_SIZE: ${PROVIDER_PAGE_SIZE:-}
+      PROVIDER_MAX_PAGES: ${PROVIDER_MAX_PAGES:-}
+      PROVIDER_REQUESTS_PER_SECOND: ${PROVIDER_REQUESTS_PER_SECOND:-}
+      CACHE_TTL: ${CACHE_TTL:-}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
     ports:
       - "${APP_PORT:-8080}:8080"
     depends_on:

@@ -81,17 +81,23 @@ paths:
       summary: Run ingestion now
       operationId: runIngestion
       description: |
-        Fetches every provider and stores what changed. Ingestion also runs on
-        start-up and every five minutes, so this is only needed to refresh on
-        demand. Only one run happens at a time across all instances. The
-        endpoint is disabled unless `ADMIN_API_KEY` is set.
+        Fetches every provider and stores what changed, one page per
+        transaction. Ingestion also runs on start-up and every five minutes,
+        so this is only needed to refresh on demand. Only one run happens at a
+        time across all instances. The endpoint is disabled unless
+        `ADMIN_API_KEY` is set.
+
+        The response comes when the run is over, which for a very large feed
+        can take a while (`INGEST_TIMEOUT` bounds it). A client that stops
+        waiting does not cancel the run.
       security:
         - apiKey: []
       responses:
         "200":
           description: |
             The run finished. A provider that failed is reported with an
-            `error`; the others are stored regardless.
+            `error`, and its counts cover the pages stored before the failure;
+            the other providers are stored regardless.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/IngestResponse" }
@@ -254,9 +260,10 @@ components:
           type: array
           items:
             type: object
-            required: [provider, fetched, rejected, changed, duration_ms]
+            required: [provider, pages, fetched, rejected, changed, duration_ms]
             properties:
               provider: { type: string, example: provider1 }
+              pages: { type: integer, description: Pages fetched and stored., example: 1 }
               fetched: { type: integer, description: Items that passed validation., example: 4 }
               rejected: { type: integer, description: Items left out as invalid; see the logs., example: 0 }
               changed: { type: integer, description: Rows inserted or updated., example: 4 }

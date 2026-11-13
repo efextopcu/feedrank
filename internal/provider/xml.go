@@ -23,14 +23,13 @@ import (
 //
 // It calls text "article", and its dates have no time or zone, so they are
 // read as midnight UTC.
-func NewXMLProvider(name, url string, client *Client) (*HTTPProvider, error) {
+func NewXMLProvider(name, url string, paging Paging, client *Client) (*HTTPProvider, error) {
 	return New(Spec{
 		Name:      name,
 		URL:       url,
 		PageParam: "page",
 		SizeParam: "items_per_page",
-		PageSize:  defaultPageSize,
-		MaxPages:  defaultMaxPages,
+		Paging:    paging,
 		Decode:    decodeXML,
 		Types: map[string]domain.ContentType{
 			"video":   domain.Video,

@@ -85,32 +85,79 @@ func TestSearchCacheWorksWithoutRedis(t *testing.T) {
 
 func TestLocker(t *testing.T) {
 	mr, client := newRedis(t)
-	locker := NewLocker(client)
+	locker := NewLocker(client, time.Minute)
 	ctx := context.Background()
 
-	unlock, ok, err := locker.TryLock(ctx, "ingest", time.Minute)
+	_, release, ok, err := locker.TryLock(ctx, "ingest")
 	if err != nil || !ok {
 		t.Fatalf("first TryLock: ok %v err %v", ok, err)
 	}
-	if _, ok, _ := locker.TryLock(ctx, "ingest", time.Minute); ok {
+	if _, _, ok, _ := locker.TryLock(ctx, "ingest"); ok {
 		t.Fatal("a held lock was granted twice")
 	}
 
-	unlock()
-	unlock2, ok, _ := locker.TryLock(ctx, "ingest", time.Minute)
+	release()
+	_, release2, ok, _ := locker.TryLock(ctx, "ingest")
 	if !ok {
 		t.Fatal("lock was not released")
 	}
 
 	// A holder whose lock expired must not release the next holder's lock.
 	mr.FastForward(2 * time.Minute)
-	_, ok, _ = locker.TryLock(ctx, "ingest", time.Minute)
+	_, release3, ok, _ := locker.TryLock(ctx, "ingest")
 	if !ok {
 		t.Fatal("expired lock was not freed")
 	}
-	unlock2()
-	if _, ok, _ := locker.TryLock(ctx, "ingest", time.Minute); ok {
+	defer release3()
+	release2()
+	if _, _, ok, _ := locker.TryLock(ctx, "ingest"); ok {
 		t.Fatal("a stale holder released someone else's lock")
+	}
+}
+
+// miniredis only expires keys when told to, so these tests move its clock by
+// hand and let the renewals run in real time.
+func TestLockerRenewsAHeldLock(t *testing.T) {
+	mr, client := newRedis(t)
+	ttl := 300 * time.Millisecond
+	_, release, ok, err := NewLocker(client, ttl).TryLock(context.Background(), "ingest")
+	if err != nil || !ok {
+		t.Fatalf("TryLock: ok %v err %v", ok, err)
+	}
+	defer release()
+
+	mr.FastForward(250 * time.Millisecond) // 50ms left
+	time.Sleep(ttl / 2)                    // at least one renewal
+	if left := mr.TTL(keyPrefix + "lock:ingest"); left <= ttl/2 {
+		t.Errorf("TTL = %v after a renewal, want it reset to %v", left, ttl)
+	}
+}
+
+func TestLockerCancelsWhenTheLockIsLost(t *testing.T) {
+	mr, client := newRedis(t)
+	held, release, ok, err := NewLocker(client, 150*time.Millisecond).TryLock(context.Background(), "ingest")
+	if err != nil || !ok {
+		t.Fatalf("TryLock: ok %v err %v", ok, err)
+	}
+
+	// The lock expires and another instance takes it.
+	key := keyPrefix + "lock:ingest"
+	if err := mr.Set(key, "someone-else"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-held.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the held context was not cancelled after the lock was lost")
+	}
+	if cause := context.Cause(held); !errors.Is(cause, ErrLockLost) {
+		t.Errorf("cause = %v, want ErrLockLost", cause)
+	}
+
+	release()
+	if v, _ := mr.Get(key); v != "someone-else" {
+		t.Errorf("release deleted the new holder's lock (value now %q)", v)
 	}
 }
 

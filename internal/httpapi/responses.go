@@ -124,6 +124,7 @@ type ingestResponse struct {
 
 type ingestResult struct {
 	Provider   string `json:"provider"`
+	Pages      int    `json:"pages"`
 	Fetched    int    `json:"fetched"`
 	Rejected   int    `json:"rejected"`
 	Changed    int    `json:"changed"`
@@ -136,6 +137,7 @@ func newIngestResponse(results []ingest.Result) ingestResponse {
 	for _, r := range results {
 		res := ingestResult{
 			Provider:   r.Provider,
+			Pages:      r.Pages,
 			Fetched:    r.Fetched,
 			Rejected:   r.Rejected,
 			Changed:    r.Changed,

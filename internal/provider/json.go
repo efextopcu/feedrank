@@ -13,14 +13,13 @@ import (
 //	   "metrics": {"views": 15000, "likes": 1200, "duration": "15:30"},
 //	   "published_at": "2024-03-15T10:00:00Z", "tags": ["programming"]}],
 //	 "pagination": {"total": 150, "page": 1, "per_page": 10}}
-func NewJSONProvider(name, url string, client *Client) (*HTTPProvider, error) {
+func NewJSONProvider(name, url string, paging Paging, client *Client) (*HTTPProvider, error) {
 	return New(Spec{
 		Name:      name,
 		URL:       url,
 		PageParam: "page",
 		SizeParam: "per_page",
-		PageSize:  defaultPageSize,
-		MaxPages:  defaultMaxPages,
+		Paging:    paging,
 		Decode:    decodeJSON,
 		Types: map[string]domain.ContentType{
 			"video": domain.Video,

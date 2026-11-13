@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -72,13 +73,15 @@ func parseSearchQuery(v url.Values) (domain.SearchQuery, error) {
 	return q, nil
 }
 
-// handleIngest runs ingestion and reports each provider's outcome. The run
-// itself is bounded by the ingest package, so the write deadline is extended
-// to cover it.
+// handleIngest runs ingestion and reports each provider's outcome once the run
+// is over. A large feed can take a long time, so the server's write deadline
+// is lifted (INGEST_TIMEOUT bounds the run instead), and the run is detached
+// from the request: a client that gives up waiting does not throw away a run
+// that is half done.
 func (h *handlers) handleIngest(w http.ResponseWriter, r *http.Request) {
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
-	results, err := h.ingest.Run(r.Context())
+	results, err := h.ingest.Run(context.WithoutCancel(r.Context()))
 	if err != nil {
 		writeError(w, r, err)
 		return

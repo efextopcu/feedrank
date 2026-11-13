@@ -26,6 +26,13 @@ type Config struct {
 	Provider1URL   string        // PROVIDER1_URL
 	Provider2URL   string        // PROVIDER2_URL
 	IngestInterval time.Duration // INGEST_INTERVAL
+	IngestTimeout  time.Duration // INGEST_TIMEOUT: bounds one run
+
+	// How each provider is paged and paced. The defaults allow a million items
+	// per provider; at five requests a second that takes about half an hour.
+	ProviderPageSize          int // PROVIDER_PAGE_SIZE
+	ProviderMaxPages          int // PROVIDER_MAX_PAGES
+	ProviderRequestsPerSecond int // PROVIDER_REQUESTS_PER_SECOND
 
 	CacheTTL time.Duration // CACHE_TTL
 	// RateLimitPerMinute is the request budget per client IP. Zero disables it.
@@ -39,13 +46,19 @@ type Config struct {
 func Load() (Config, error) {
 	r := reader{}
 	cfg := Config{
-		Addr:               r.str("HTTP_ADDR", ":8080"),
-		DatabaseURL:        r.str("DATABASE_URL", "postgres://search:search@localhost:5432/search?sslmode=disable"),
-		RedisAddr:          r.str("REDIS_ADDR", ""),
-		AdminAPIKey:        r.str("ADMIN_API_KEY", ""),
-		Provider1URL:       r.url("PROVIDER1_URL"),
-		Provider2URL:       r.url("PROVIDER2_URL"),
-		IngestInterval:     r.duration("INGEST_INTERVAL", 5*time.Minute),
+		Addr:           r.str("HTTP_ADDR", ":8080"),
+		DatabaseURL:    r.str("DATABASE_URL", "postgres://search:search@localhost:5432/search?sslmode=disable"),
+		RedisAddr:      r.str("REDIS_ADDR", ""),
+		AdminAPIKey:    r.str("ADMIN_API_KEY", ""),
+		Provider1URL:   r.url("PROVIDER1_URL"),
+		Provider2URL:   r.url("PROVIDER2_URL"),
+		IngestInterval: r.duration("INGEST_INTERVAL", 5*time.Minute),
+		IngestTimeout:  r.duration("INGEST_TIMEOUT", time.Hour),
+
+		ProviderPageSize:          r.positive("PROVIDER_PAGE_SIZE", 100),
+		ProviderMaxPages:          r.positive("PROVIDER_MAX_PAGES", 10_000),
+		ProviderRequestsPerSecond: r.positive("PROVIDER_REQUESTS_PER_SECOND", 5),
+
 		CacheTTL:           r.duration("CACHE_TTL", time.Minute),
 		RateLimitPerMinute: r.integer("RATE_LIMIT_PER_MINUTE", 120),
 		LogLevel:           r.level("LOG_LEVEL", slog.LevelInfo),
@@ -96,6 +109,15 @@ func (r *reader) integer(key string, def int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
 		r.errs = append(r.errs, fmt.Errorf("%s: %q is not a non-negative integer", key, v))
+		return def
+	}
+	return n
+}
+
+func (r *reader) positive(key string, def int) int {
+	n := r.integer(key, def)
+	if n == 0 {
+		r.errs = append(r.errs, fmt.Errorf("%s: must be at least 1", key))
 		return def
 	}
 	return n

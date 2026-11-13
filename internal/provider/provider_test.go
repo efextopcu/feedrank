@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +38,28 @@ func serve(t *testing.T, body string) (*httptest.Server, *atomic.Int32) {
 	return srv, &calls
 }
 
+// walk is what ranging over a provider's pages to the end produced.
+type walk struct {
+	Items    []domain.Content
+	Rejected []Rejection
+	Pages    int
+}
+
+// collect ranges over every page, as ingestion does, and keeps what the pages
+// before an error brought.
+func collect(p Provider) (walk, error) {
+	var w walk
+	for page, err := range p.Pages(context.Background()) {
+		if err != nil {
+			return w, err
+		}
+		w.Pages++
+		w.Items = append(w.Items, page.Items...)
+		w.Rejected = append(w.Rejected, page.Rejected...)
+	}
+	return w, nil
+}
+
 func fixture(t *testing.T, name string) string {
 	t.Helper()
 	b, err := os.ReadFile("testdata/" + name)
@@ -48,12 +71,12 @@ func fixture(t *testing.T, name string) string {
 
 func TestJSONProviderFixture(t *testing.T) {
 	srv, calls := serve(t, fixture(t, "provider1.json"))
-	p, err := NewJSONProvider("provider1", srv.URL, NewClient(testClientConfig()))
+	p, err := NewJSONProvider("provider1", srv.URL, DefaultPaging(), NewClient(testClientConfig()))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	batch, err := p.Fetch(context.Background())
+	batch, err := collect(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,12 +104,12 @@ func TestJSONProviderFixture(t *testing.T) {
 
 func TestXMLProviderFixture(t *testing.T) {
 	srv, _ := serve(t, fixture(t, "provider2.xml"))
-	p, err := NewXMLProvider("provider2", srv.URL, NewClient(testClientConfig()))
+	p, err := NewXMLProvider("provider2", srv.URL, DefaultPaging(), NewClient(testClientConfig()))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	batch, err := p.Fetch(context.Background())
+	batch, err := collect(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +135,7 @@ func TestXMLProviderFixture(t *testing.T) {
 func pagedSpec(url string) Spec {
 	return Spec{
 		Name: "paged", URL: url,
-		PageParam: "page", SizeParam: "size", PageSize: 2, MaxPages: 10,
+		PageParam: "page", SizeParam: "size", Paging: Paging{Size: 2, MaxPages: 10},
 		Decode:      decodeJSON,
 		Types:       map[string]domain.ContentType{"video": domain.Video},
 		DateLayouts: []string{time.RFC3339},
@@ -128,7 +151,7 @@ func jsonItems(ids ...string) string {
 	return `{"contents": [` + strings.Join(parts, ",") + `]}`
 }
 
-func TestFetchWalksPagesUntilAShortPage(t *testing.T) {
+func TestPagesWalkUntilAShortPage(t *testing.T) {
 	pages := map[string]string{
 		"1": jsonItems("a", "b"),
 		"2": jsonItems("c", "d"),
@@ -148,25 +171,25 @@ func TestFetchWalksPagesUntilAShortPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch, err := p.Fetch(context.Background())
+	batch, err := collect(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(batch.Items) != 5 || calls.Load() != 3 {
-		t.Errorf("got %d items in %d requests, want 5 in 3", len(batch.Items), calls.Load())
+	if len(batch.Items) != 5 || batch.Pages != 3 || calls.Load() != 3 {
+		t.Errorf("got %d items on %d pages in %d requests, want 5 on 3 in 3", len(batch.Items), batch.Pages, calls.Load())
 	}
 }
 
 // The live endpoints ignore the page parameter. A full page of ids already
 // seen must end the walk instead of re-fetching the same page MaxPages times.
-func TestFetchStopsWhenAPageRepeats(t *testing.T) {
+func TestPagesStopWhenAPageRepeats(t *testing.T) {
 	srv, calls := serve(t, jsonItems("a", "b"))
 	p, err := New(pagedSpec(srv.URL), NewClient(testClientConfig()))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	batch, err := p.Fetch(context.Background())
+	batch, err := collect(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +198,9 @@ func TestFetchStopsWhenAPageRepeats(t *testing.T) {
 	}
 }
 
-func TestFetchFailsWhenAnyPageFails(t *testing.T) {
+// A failed page ends the walk with its error, and the pages before it stand:
+// ingestion has already stored them by then.
+func TestPagesEndWithTheFailingPage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("page") == "2" {
 			http.NotFound(w, r)
@@ -189,12 +214,65 @@ func TestFetchFailsWhenAnyPageFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch, err := p.Fetch(context.Background())
+	batch, err := collect(p)
 	if err == nil || !strings.Contains(err.Error(), "page 2") {
 		t.Fatalf("err = %v, want a page 2 failure", err)
 	}
-	if len(batch.Items) != 0 {
-		t.Errorf("a failed fetch returned %d items; it should return none", len(batch.Items))
+	if batch.Pages != 1 || len(batch.Items) != 2 {
+		t.Errorf("got %d items on %d pages before the failure, want page 1's 2 items", len(batch.Items), batch.Pages)
+	}
+}
+
+// A provider that keeps sending full pages of new items is cut off at
+// MaxPages, and that is reported rather than passed over.
+func TestPagesReportThePageLimit(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		page := r.URL.Query().Get("page")
+		fmt.Fprint(w, jsonItems(page+"a", page+"b"))
+	}))
+	defer srv.Close()
+
+	spec := pagedSpec(srv.URL)
+	spec.Paging.MaxPages = 3
+	p, err := New(spec, NewClient(testClientConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := collect(p)
+	if !errors.Is(err, ErrPageLimit) {
+		t.Fatalf("err = %v, want ErrPageLimit", err)
+	}
+	if batch.Pages != 3 || len(batch.Items) != 6 || calls.Load() != 3 {
+		t.Errorf("got %d items on %d pages in %d requests, want 6 on 3 in 3", len(batch.Items), batch.Pages, calls.Load())
+	}
+}
+
+// Ranging is lazy: a caller that stops early causes no further requests.
+func TestPagesStopWhenTheCallerStops(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		page := r.URL.Query().Get("page")
+		fmt.Fprint(w, jsonItems(page+"a", page+"b"))
+	}))
+	defer srv.Close()
+
+	p, err := New(pagedSpec(srv.URL), NewClient(testClientConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for page, err := range p.Pages(context.Background()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Number == 2 {
+			break
+		}
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("made %d requests, want 2", n)
 	}
 }
 
@@ -208,12 +286,12 @@ func TestBadItemsAreRejectedNotFatal(t *testing.T) {
 		{"id": "n", "title": "Negative", "type": "video", "published_at": "2024-01-01T00:00:00Z", "metrics": {"views": -1}}
 	]}`
 	srv, _ := serve(t, body)
-	p, err := NewJSONProvider("provider1", srv.URL, NewClient(testClientConfig()))
+	p, err := NewJSONProvider("provider1", srv.URL, DefaultPaging(), NewClient(testClientConfig()))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	batch, err := p.Fetch(context.Background())
+	batch, err := collect(p)
 	if err != nil {
 		t.Fatal(err)
 	}

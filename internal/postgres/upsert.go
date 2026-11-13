@@ -41,8 +41,9 @@ WHERE (contents.title, contents.content_type, contents.tags, contents.published_
        EXCLUDED.views, EXCLUDED.likes, EXCLUDED.reading_time, EXCLUDED.reactions,
        EXCLUDED.base_score, EXCLUDED.type_coefficient, EXCLUDED.engagement_score)`
 
-// Upsert writes items in a single transaction, so a provider's batch is stored
-// completely or not at all. It returns how many rows were inserted or changed.
+// Upsert writes items in one transaction, so they are stored together or not
+// at all; ingestion calls it once per provider page. Statements are pipelined
+// in a single round trip. It returns how many rows were inserted or changed.
 // Items must already be scored.
 func (s *Store) Upsert(ctx context.Context, items []domain.Content) (int, error) {
 	if len(items) == 0 {

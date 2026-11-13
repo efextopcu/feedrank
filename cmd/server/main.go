@@ -69,7 +69,9 @@ func run() error {
 
 		searchCache := redisstore.NewSearchCache(rdb, cfg.CacheTTL, log)
 		cache, invalidator = searchCache, searchCache
-		locker = redisstore.NewLocker(rdb)
+		// Renewed while a run is working, so a crashed instance frees it
+		// within lockTTL however long runs take.
+		locker = redisstore.NewLocker(rdb, lockTTL)
 		if cfg.RateLimitPerMinute > 0 {
 			limiter = redisstore.NewRateLimiter(rdb, cfg.RateLimitPerMinute, time.Minute)
 		}
@@ -84,6 +86,7 @@ func run() error {
 		Store:     store,
 		Locker:    locker,
 		Cache:     invalidator,
+		Timeout:   cfg.IngestTimeout,
 		Logger:    log,
 	})
 
@@ -122,21 +125,31 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	err = srv.Shutdown(shutdownCtx)
-	background.Wait() // let an in-flight ingestion finish or roll back cleanly
+	background.Wait() // an in-flight run stops after its current page
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("shutting down: %w", err)
 	}
 	return nil
 }
 
+const lockTTL = 30 * time.Second
+
 // newProviders builds the two providers from the brief. A new provider is one
-// more entry here, plus its decoder in package provider.
+// more entry here, plus its decoder in package provider. Each gets its own
+// client, so their rate limits and circuit breakers are independent.
 func newProviders(cfg config.Config) ([]provider.Provider, error) {
-	p1, err := provider.NewJSONProvider("provider1", cfg.Provider1URL, provider.NewClient(provider.DefaultClientConfig()))
+	paging := provider.Paging{Size: cfg.ProviderPageSize, MaxPages: cfg.ProviderMaxPages}
+	client := func() *provider.Client {
+		c := provider.DefaultClientConfig()
+		c.RequestsPerSecond = float64(cfg.ProviderRequestsPerSecond)
+		return provider.NewClient(c)
+	}
+
+	p1, err := provider.NewJSONProvider("provider1", cfg.Provider1URL, paging, client())
 	if err != nil {
 		return nil, err
 	}
-	p2, err := provider.NewXMLProvider("provider2", cfg.Provider2URL, provider.NewClient(provider.DefaultClientConfig()))
+	p2, err := provider.NewXMLProvider("provider2", cfg.Provider2URL, paging, client())
 	if err != nil {
 		return nil, err
 	}

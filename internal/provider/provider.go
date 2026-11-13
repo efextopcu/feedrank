@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,16 +22,25 @@ import (
 // Provider is a source of content.
 type Provider interface {
 	Name() string
-	Fetch(ctx context.Context) (Batch, error)
+	// Pages fetches the provider's content one page at a time, so a feed of
+	// any size is processed in bounded memory. The sequence ends at the end of
+	// the feed, when the caller stops ranging, or with a single error.
+	Pages(ctx context.Context) iter.Seq2[Page, error]
 }
 
-// Batch is the outcome of one fetch.
-type Batch struct {
-	Items []domain.Content
+// Page is one page of a provider's feed, normalised.
+type Page struct {
+	Number int
+	Items  []domain.Content
 	// Rejected lists items that failed normalisation. A bad item is left out
-	// on its own; it never fails the batch.
+	// on its own; it never fails the page.
 	Rejected []Rejection
 }
+
+// ErrPageLimit ends a walk that reached Paging.MaxPages while the provider
+// still had more to give. The pages before it are valid; the rest of the feed
+// was not fetched.
+var ErrPageLimit = errors.New("stopped at the page limit; the rest of the feed was not fetched")
 
 // Rejection explains why one item was left out.
 type Rejection struct {
@@ -52,6 +62,17 @@ type RawItem struct {
 	Reactions   int64
 }
 
+// Paging sets how much of a feed one walk requests.
+type Paging struct {
+	Size int // items asked for per page
+	// MaxPages caps one walk, in case a provider pages forever. Reaching it is
+	// reported as ErrPageLimit, never passed over in silence.
+	MaxPages int
+}
+
+// DefaultPaging allows a million items per provider in pages of 100.
+func DefaultPaging() Paging { return Paging{Size: 100, MaxPages: 10_000} }
+
 // Spec describes one provider.
 type Spec struct {
 	Name string
@@ -60,9 +81,7 @@ type Spec struct {
 	// PageParam and SizeParam name the query parameters used for paging.
 	PageParam string
 	SizeParam string
-	PageSize  int
-	// MaxPages caps one fetch, in case a provider never sends a short page.
-	MaxPages int
+	Paging    Paging
 
 	// Decode parses one response body.
 	Decode func(body []byte) ([]RawItem, error)
@@ -73,12 +92,6 @@ type Spec struct {
 	// DateLayouts are tried in order. A date without a zone is read as UTC.
 	DateLayouts []string
 }
-
-// Paging defaults shared by the built-in providers.
-const (
-	defaultPageSize = 50
-	defaultMaxPages = 20
-)
 
 // HTTPProvider fetches a Spec over HTTP.
 type HTTPProvider struct {
@@ -97,8 +110,8 @@ func New(spec Spec, client *Client) (*HTTPProvider, error) {
 		return nil, fmt.Errorf("provider %s: %q is not an http(s) URL", spec.Name, spec.URL)
 	case spec.Decode == nil || len(spec.Types) == 0 || len(spec.DateLayouts) == 0:
 		return nil, fmt.Errorf("provider %s: spec needs Decode, Types and DateLayouts", spec.Name)
-	case spec.PageParam == "" || spec.PageSize < 1 || spec.MaxPages < 1:
-		return nil, fmt.Errorf("provider %s: spec needs PageParam, PageSize and MaxPages", spec.Name)
+	case spec.PageParam == "" || spec.Paging.Size < 1 || spec.Paging.MaxPages < 1:
+		return nil, fmt.Errorf("provider %s: spec needs PageParam and a positive page size and page limit", spec.Name)
 	}
 	return &HTTPProvider{spec: spec, base: base, client: client}, nil
 }
@@ -106,48 +119,62 @@ func New(spec Spec, client *Client) (*HTTPProvider, error) {
 // Name returns the provider's name, which is also its storage key.
 func (p *HTTPProvider) Name() string { return p.spec.Name }
 
-// Fetch walks the provider's pages and returns every item it offers.
+// Pages walks the provider's pages, yielding each as soon as it is fetched.
 //
-// The walk stops at a short page, or at a page that brings no new ids: both
-// live endpoints ignore the page parameter and serve the same items for every
-// page. A failed page fails the whole fetch, so a run stores all of a
-// provider's items or none of them.
-func (p *HTTPProvider) Fetch(ctx context.Context) (Batch, error) {
-	var batch Batch
-	seen := make(map[string]bool)
+// The walk ends at a short page, or at a page that brings nothing new since
+// the one before: both live endpoints ignore the page parameter and serve the
+// same items for every page. Only the previous page's ids are remembered, so
+// memory stays bounded however long the feed is. A failed page ends the walk
+// with its error; the pages already yielded stand.
+func (p *HTTPProvider) Pages(ctx context.Context) iter.Seq2[Page, error] {
+	return func(yield func(Page, error) bool) {
+		var previous map[string]bool
 
-	for page := 1; page <= p.spec.MaxPages; page++ {
-		body, err := p.client.Get(ctx, p.pageURL(page))
-		if err != nil {
-			return Batch{}, fmt.Errorf("%s page %d: %w", p.spec.Name, page, err)
-		}
-		raw, err := p.spec.Decode(body)
-		if err != nil {
-			return Batch{}, fmt.Errorf("%s page %d: decoding: %w", p.spec.Name, page, err)
-		}
-
-		fresh := 0
-		for _, r := range raw {
-			id := strings.TrimSpace(r.ID)
-			if id != "" && seen[id] {
-				continue
+		for n := 1; ; n++ {
+			if n > p.spec.Paging.MaxPages {
+				yield(Page{}, fmt.Errorf("%s: %w (%d pages)", p.spec.Name, ErrPageLimit, p.spec.Paging.MaxPages))
+				return
 			}
-			seen[id] = true
-			fresh++
 
-			item, err := p.normalize(r)
+			body, err := p.client.Get(ctx, p.pageURL(n))
 			if err != nil {
-				batch.Rejected = append(batch.Rejected, Rejection{ExternalID: id, Reason: err.Error()})
-				continue
+				yield(Page{}, fmt.Errorf("%s page %d: %w", p.spec.Name, n, err))
+				return
 			}
-			batch.Items = append(batch.Items, item)
-		}
+			raw, err := p.spec.Decode(body)
+			if err != nil {
+				yield(Page{}, fmt.Errorf("%s page %d: decoding: %w", p.spec.Name, n, err))
+				return
+			}
 
-		if len(raw) < p.spec.PageSize || fresh == 0 {
-			break
+			page := Page{Number: n}
+			current := make(map[string]bool, len(raw))
+			for _, r := range raw {
+				id := strings.TrimSpace(r.ID)
+				if id != "" {
+					if current[id] || previous[id] {
+						continue
+					}
+					current[id] = true
+				}
+
+				item, err := p.normalize(r)
+				if err != nil {
+					page.Rejected = append(page.Rejected, Rejection{ExternalID: id, Reason: err.Error()})
+					continue
+				}
+				page.Items = append(page.Items, item)
+			}
+
+			if len(current) == 0 {
+				return // nothing new: the provider is repeating itself
+			}
+			if !yield(page, nil) || len(raw) < p.spec.Paging.Size {
+				return
+			}
+			previous = current
 		}
 	}
-	return batch, nil
 }
 
 func (p *HTTPProvider) pageURL(page int) string {
@@ -155,7 +182,7 @@ func (p *HTTPProvider) pageURL(page int) string {
 	q := u.Query()
 	q.Set(p.spec.PageParam, strconv.Itoa(page))
 	if p.spec.SizeParam != "" {
-		q.Set(p.spec.SizeParam, strconv.Itoa(p.spec.PageSize))
+		q.Set(p.spec.SizeParam, strconv.Itoa(p.spec.Paging.Size))
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

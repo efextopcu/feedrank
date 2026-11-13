@@ -1,0 +1,1778 @@
+{
+  "info": {
+    "name": "Feedrank API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "A walkthrough of every feature, in order. Each request has a short description and tests, so you can click through and read the responses, or run the whole collection and read the test results.\n\n**Before you start:** run `make up`. If you changed the port or `ADMIN_API_KEY`, update the `baseUrl` and `apiKey` collection variables.\n\nSearch responses also show up as a table in the response's **Visualize** tab, with each score broken down.\n\nFrom a terminal, `make postman` runs the same collection with Newman.\n\nA few things to know:\n\n- The data comes from the live provider endpoints, so tests check rules (ordering, filters, the formula) rather than exact titles.\n- The caching requests need Redis, and each needs to run within a minute of the one before it (the cache TTL).\n- The rate-limit folder uses up your request budget on purpose and then waits for it to reset, which takes up to a minute. Keep it last."
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string",
+      "description": "Where the stack is listening."
+    },
+    {
+      "key": "apiKey",
+      "value": "dev-admin-key",
+      "type": "string",
+      "description": "The server's ADMIN_API_KEY."
+    },
+    {
+      "key": "cachePageSize",
+      "value": "",
+      "type": "string",
+      "description": "Set by the caching requests."
+    },
+    {
+      "key": "cachedItems",
+      "value": "",
+      "type": "string",
+      "description": "Set by the caching requests."
+    },
+    {
+      "key": "retryAfter",
+      "value": "",
+      "type": "string",
+      "description": "Set by the rate-limit requests."
+    }
+  ],
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Runs after every request in the collection.",
+          "",
+          "pm.test('Response carries an X-Request-Id', () => {",
+          "  pm.response.to.have.header('X-Request-Id');",
+          "});",
+          "",
+          "// Browser hardening headers, set on every response.",
+          "pm.test('Security headers are set', () => {",
+          "  pm.expect(pm.response.headers.get('X-Content-Type-Options')).to.equal('nosniff');",
+          "  pm.expect(pm.response.headers.get('X-Frame-Options')).to.equal('DENY');",
+          "  pm.expect(pm.response.headers.get('Referrer-Policy')).to.equal('no-referrer');",
+          "});",
+          "",
+          "// API errors are RFC 7807 problem documents. They quote the request id,",
+          "// which is also on every log line for that request.",
+          "if (pm.request.url.getPath().startsWith('/api/') && pm.response.code >= 400) {",
+          "  pm.test('Error is an RFC 7807 problem document', () => {",
+          "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/problem+json');",
+          "    const problem = pm.response.json();",
+          "    pm.expect(problem).to.include.keys('type', 'title', 'status', 'detail', 'request_id');",
+          "    pm.expect(problem.status).to.equal(pm.response.code);",
+          "    pm.expect(problem.request_id).to.equal(pm.response.headers.get('X-Request-Id'));",
+          "  });",
+          "}",
+          "",
+          "// Search results as a table, in the response's Visualize tab.",
+          "if (pm.request.url.getPath() === '/api/v1/search' && pm.response.code === 200) {",
+          "  const template = `",
+          "    <style>",
+          "      body { font: 13px system-ui, sans-serif; }",
+          "      table { border-collapse: collapse; width: 100%; }",
+          "      th, td { padding: 4px 8px; border-bottom: 1px solid #ddd; text-align: left; }",
+          "      .n { text-align: right; font-variant-numeric: tabular-nums; }",
+          "    </style>",
+          "    <p>{{pagination.total}} matches, page {{pagination.page}} of {{pagination.total_pages}},",
+          "       sorted by {{meta.sort}}{{#if meta.cached}}, from the cache{{/if}}</p>",
+          "    <table>",
+          "      <tr><th>Title</th><th>Type</th><th>Provider</th><th class=\"n\">Base × coef</th>",
+          "          <th class=\"n\">Engagement</th><th class=\"n\">Recency</th><th class=\"n\">Score</th>",
+          "          <th class=\"n\">Relevance</th></tr>",
+          "      {{#each items}}",
+          "      <tr><td>{{title}}</td><td>{{content_type}}</td><td>{{provider}}</td>",
+          "          <td class=\"n\">{{score_breakdown.base}} × {{score_breakdown.type_coefficient}}</td>",
+          "          <td class=\"n\">{{score_breakdown.engagement}}</td><td class=\"n\">{{score_breakdown.recency}}</td>",
+          "          <td class=\"n\"><b>{{score}}</b></td><td class=\"n\">{{relevance}}</td></tr>",
+          "      {{/each}}",
+          "    </table>`;",
+          "  pm.visualizer.set(template, pm.response.json());",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health",
+      "description": "Probes for an orchestrator. Liveness checks nothing but the process; readiness also needs the database. Redis is optional, so neither probe checks it.",
+      "item": [
+        {
+          "name": "Liveness",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Body is {\"status\": \"ok\"}', () => {",
+                  "  pm.expect(pm.response.json()).to.eql({ status: 'ok' });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/healthz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "The process is up. It checks no dependencies, so a database outage takes the instance out of rotation instead of restarting it."
+          },
+          "response": []
+        },
+        {
+          "name": "Readiness",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Body is {\"status\": \"ok\"}', () => {",
+                  "  pm.expect(pm.response.json()).to.eql({ status: 'ok' });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/readyz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            },
+            "description": "The instance can reach Postgres and serve traffic. Answers 503 when it cannot."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Ingestion",
+      "description": "Ingestion fetches both providers, drops items it cannot trust, scores the rest and upserts them. It runs on start-up and every five minutes; this endpoint triggers a run on demand and needs the admin key.",
+      "item": [
+        {
+          "name": "Without an API key: 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', () => pm.response.to.have.status(401));",
+                  "pm.test('The error names the header it wants', () => {",
+                  "  pm.expect(pm.response.json().detail).to.include('X-API-Key');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ingest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ingest"
+              ]
+            },
+            "description": "The ingest endpoint is an admin action, so a request without `X-API-Key` is refused."
+          },
+          "response": []
+        },
+        {
+          "name": "With a wrong API key: 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', () => pm.response.to.have.status(401));",
+                  "pm.test('The error names the header it wants', () => {",
+                  "  pm.expect(pm.response.json().detail).to.include('X-API-Key');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-API-Key",
+                "value": "not-the-key",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ingest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ingest"
+              ]
+            },
+            "description": "A wrong key gets the same answer. The comparison runs in constant time."
+          },
+          "response": []
+        },
+        {
+          "name": "Run ingestion",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const { providers } = pm.response.json();",
+                  "pm.test('Both providers report back', () => {",
+                  "  pm.expect(providers.map((p) => p.provider)).to.have.members(['provider1', 'provider2']);",
+                  "});",
+                  "providers.forEach((p) => {",
+                  "  pm.test(`${p.provider}: fetched ${p.fetched}, rejected ${p.rejected}, changed ${p.changed}`, () => {",
+                  "    pm.expect(p.error, p.error).to.be.undefined;",
+                  "    pm.expect(p.fetched).to.be.above(0);",
+                  "    pm.expect(p.changed).to.be.within(0, p.fetched);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-API-Key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ingest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ingest"
+              ]
+            },
+            "description": "Runs ingestion now and reports each provider:\n\n- `fetched`: items that passed validation\n- `rejected`: items left out (unknown type, bad date, negative counter); the server logs why\n- `changed`: rows actually written\n\nUnchanged rows are skipped, so running this again reports `changed: 0` and leaves the search cache alone. A provider that fails is reported with an `error`; the other one is still stored."
+          },
+          "response": []
+        },
+        {
+          "name": "Two runs at once: one gets 409",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const startRun = () => new Promise((resolve) => {",
+                  "  pm.sendRequest({",
+                  "    url: pm.variables.replaceIn('{{baseUrl}}/api/v1/ingest'),",
+                  "    method: 'POST',",
+                  "    header: { 'X-API-Key': pm.variables.get('apiKey') },",
+                  "  }, (err, res) => resolve(err ? err.message : res.code));",
+                  "});",
+                  "",
+                  "Promise.all([startRun(), startRun()]).then((codes) => {",
+                  "  pm.test(`Parallel runs answered ${codes.join(' and ')}: one 200, one 409`, () => {",
+                  "    pm.expect([...codes].sort()).to.eql([200, 409]);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-API-Key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ingest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ingest"
+              ]
+            },
+            "description": "Only one ingestion runs at a time, across every instance, thanks to a Redis lock (`SET NX` with a TTL, released by a compare-and-delete script). A run that loses the race gets 409.\n\nPostman sends one request at a time, so after this request the test script starts two more runs side by side and checks that exactly one was refused. Without Redis there is no lock, and both succeed."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Search",
+      "description": "`GET /api/v1/search` takes `q`, `type`, `sort`, `page` and `page_size`, all optional. Each result carries its score broken down term by term, so any ranking can be checked by hand.\n\n```\nfinal = base × type_coefficient + engagement + recency\n```",
+      "item": [
+        {
+          "name": "List everything, by popularity",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const { items, pagination, meta } = pm.response.json();",
+                  "",
+                  "pm.test('Without a keyword the sort defaults to popularity', () => {",
+                  "  pm.expect(meta.sort).to.equal('popularity');",
+                  "});",
+                  "pm.test('Results are ordered by score, highest first', () => {",
+                  "  const scores = items.map((i) => i.score);",
+                  "  pm.expect(scores).to.eql([...scores].sort((a, b) => b - a));",
+                  "});",
+                  "pm.test('Pagination defaults to page 1, 20 per page', () => {",
+                  "  pm.expect(pagination).to.include({ page: 1, page_size: 20 });",
+                  "  pm.expect(pagination.total_pages).to.equal(Math.ceil(pagination.total / 20));",
+                  "});",
+                  "pm.test('Each item carries only the counters for its type', () => {",
+                  "  items.forEach((i) => {",
+                  "    const counters = i.content_type === 'video' ? ['views', 'likes'] : ['reading_time', 'reactions'];",
+                  "    pm.expect(Object.keys(i.metrics), i.title).to.have.members(counters);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ]
+            },
+            "description": "With no parameters you get every item, highest score first, 20 per page. Each item carries only the counters its type has: views and likes for videos, reading time and reactions for text."
+          },
+          "response": []
+        },
+        {
+          "name": "Scores follow the formula",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const DAY = 24 * 60 * 60 * 1000;",
+                  "const ratio = (n, d) => (d > 0 ? n / d : 0);",
+                  "const recency = (publishedAt) => {",
+                  "  const age = Date.now() - Date.parse(publishedAt);",
+                  "  if (age <= 7 * DAY) return 5;",
+                  "  if (age <= 30 * DAY) return 3;",
+                  "  if (age <= 90 * DAY) return 1;",
+                  "  return 0;",
+                  "};",
+                  "const expected = ({ content_type: type, metrics: m, published_at: publishedAt }) => {",
+                  "  const terms = type === 'video'",
+                  "    ? { base: m.views / 1000 + m.likes / 100, type_coefficient: 1.5, engagement: ratio(m.likes, m.views) * 10 }",
+                  "    : { base: m.reading_time + m.reactions / 50, type_coefficient: 1.0, engagement: ratio(m.reactions, m.reading_time) * 5 };",
+                  "  terms.recency = recency(publishedAt);",
+                  "  terms.final = terms.base * terms.type_coefficient + terms.engagement + terms.recency;",
+                  "  return terms;",
+                  "};",
+                  "",
+                  "pm.response.json().items.forEach((item) => {",
+                  "  pm.test(`${item.title}: ${item.score}`, () => {",
+                  "    for (const [term, value] of Object.entries(expected(item))) {",
+                  "      pm.expect(item.score_breakdown[term], term).to.be.closeTo(value, 0.001);",
+                  "    }",
+                  "    pm.expect(item.score).to.equal(item.score_breakdown.final);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page_size=100",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page_size",
+                  "value": "100",
+                  "description": "the maximum, to check every item"
+                }
+              ]
+            },
+            "description": "The test script recomputes every score from the raw counters and the publish date, and compares each term with `score_breakdown`.\n\n| | Video | Text |\n| --- | --- | --- |\n| base | views/1000 + likes/100 | reading_time + reactions/50 |\n| type coefficient | 1.5 | 1.0 |\n| engagement | (likes/views) × 10 | (reactions/reading_time) × 5 |\n\nRecency adds 5 within a week, 3 within 30 days, 1 within 90 days. It is computed when the query runs, so it never goes stale. A zero denominator makes engagement 0."
+          },
+          "response": []
+        },
+        {
+          "name": "Only videos",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const type = pm.request.url.query.get('type');",
+                  "const { items } = pm.response.json();",
+                  "pm.test(`Every result is ${type}`, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => pm.expect(i.content_type, i.title).to.equal(type));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?type=video",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "type",
+                  "value": "video",
+                  "description": "video or text"
+                }
+              ]
+            },
+            "description": "Filters on the content type."
+          },
+          "response": []
+        },
+        {
+          "name": "Only text",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const type = pm.request.url.query.get('type');",
+                  "const { items } = pm.response.json();",
+                  "pm.test(`Every result is ${type}`, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => pm.expect(i.content_type, i.title).to.equal(type));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?type=text",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "type",
+                  "value": "text",
+                  "description": "video or text"
+                }
+              ]
+            },
+            "description": "Provider 2 calls these `article`; ingestion maps them to `text`. Text engagement (reactions per minute of reading) has no upper bound, while video engagement can never exceed 10, so a well-liked article can outrank every video."
+          },
+          "response": []
+        },
+        {
+          "name": "Keyword search, by relevance",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const keyword = pm.request.url.query.get('q');",
+                  "const { items, meta } = pm.response.json();",
+                  "",
+                  "pm.test('With a keyword the sort defaults to relevance', () => {",
+                  "  pm.expect(meta.sort).to.equal('relevance');",
+                  "});",
+                  "pm.test(`Every result mentions \"${keyword}\"`, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => pm.expect(`${i.title} ${i.tags.join(' ')}`.toLowerCase()).to.include(keyword));",
+                  "});",
+                  "pm.test('Ordered by relevance, ties broken by score', () => {",
+                  "  items.slice(1).forEach((b, n) => {",
+                  "    const a = items[n];",
+                  "    const inOrder = a.relevance > b.relevance || (a.relevance === b.relevance && a.score >= b.score);",
+                  "    pm.expect(inOrder, `\"${a.title}\" should come before \"${b.title}\"`).to.be.true;",
+                  "  });",
+                  "});",
+                  "pm.test('A title match ranks above tag-only matches', () => {",
+                  "  pm.expect(items[0].title.toLowerCase()).to.include(keyword);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=programming",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "programming",
+                  "description": "matched against titles and tags"
+                }
+              ]
+            },
+            "description": "With a keyword the sort defaults to relevance: how well the item matches, then its score as a tie-breaker. Titles weigh more than tags, so an item with the keyword in its title comes before items that only have it as a tag, even ones that score higher. The next request runs the same search by popularity."
+          },
+          "response": []
+        },
+        {
+          "name": "Keyword search, by popularity",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const { items, meta } = pm.response.json();",
+                  "",
+                  "pm.test('The requested sort is applied', () => pm.expect(meta.sort).to.equal('popularity'));",
+                  "pm.test('Results are ordered by score, highest first', () => {",
+                  "  const scores = items.map((i) => i.score);",
+                  "  pm.expect(scores).to.eql([...scores].sort((a, b) => b - a));",
+                  "});",
+                  "pm.test('Each match still reports its relevance', () => {",
+                  "  items.forEach((i) => pm.expect(i.relevance, i.title).to.be.above(0));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=programming&sort=popularity",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "programming",
+                  "description": "matched against titles and tags"
+                },
+                {
+                  "key": "sort",
+                  "value": "popularity",
+                  "description": "popularity or relevance"
+                }
+              ]
+            },
+            "description": "The same matches, ordered by score instead. Relevance is still reported for each one."
+          },
+          "response": []
+        },
+        {
+          "name": "Tags are searched too",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const description = \"Every result is about devops\";",
+                  "const mustMatch = \"devops\";",
+                  "const mustNotMatch = \"\";",
+                  "",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const text = (i) => `${i.title} ${i.tags.join(' ')}`.toLowerCase();",
+                  "const { items } = pm.response.json();",
+                  "pm.test(description, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => {",
+                  "    pm.expect(text(i), i.title).to.match(new RegExp(mustMatch));",
+                  "    if (mustNotMatch) pm.expect(text(i), i.title).to.not.match(new RegExp(mustNotMatch));",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=devops",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "devops",
+                  "description": "only appears in tags"
+                }
+              ]
+            },
+            "description": "No title says \"devops\", but three items are tagged with it."
+          },
+          "response": []
+        },
+        {
+          "name": "Word forms match",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const description = \"Every result has a word starting with \\\"concurr\\\"\";",
+                  "const mustMatch = \"concurr\";",
+                  "const mustNotMatch = \"\";",
+                  "",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const text = (i) => `${i.title} ${i.tags.join(' ')}`.toLowerCase();",
+                  "const { items } = pm.response.json();",
+                  "pm.test(description, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => {",
+                  "    pm.expect(text(i), i.title).to.match(new RegExp(mustMatch));",
+                  "    if (mustNotMatch) pm.expect(text(i), i.title).to.not.match(new RegExp(mustNotMatch));",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=concurrent",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "concurrent",
+                  "description": "stems to \"concurr\""
+                }
+              ]
+            },
+            "description": "Matching uses English stemming, so \"concurrent\" finds titles with \"Concurrency\". It also ignores case and accents, and folds the Turkish İ/ı, so `istanbul` would find \"İstanbul\"."
+          },
+          "response": []
+        },
+        {
+          "name": "Partial words match",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const description = \"Every result has a word starting with \\\"begin\\\"\";",
+                  "const mustMatch = \"begin\";",
+                  "const mustNotMatch = \"\";",
+                  "",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const text = (i) => `${i.title} ${i.tags.join(' ')}`.toLowerCase();",
+                  "const { items } = pm.response.json();",
+                  "pm.test(description, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => {",
+                  "    pm.expect(text(i), i.title).to.match(new RegExp(mustMatch));",
+                  "    if (mustNotMatch) pm.expect(text(i), i.title).to.not.match(new RegExp(mustNotMatch));",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=begin",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "begin",
+                  "description": "the start of a longer word"
+                }
+              ]
+            },
+            "description": "Words of three or more letters also match as prefixes, so results show up while a word is still being typed. Shorter words must match whole, or `go` would match \"good\" and \"google\"."
+          },
+          "response": []
+        },
+        {
+          "name": "Either word (or)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const description = \"Every result mentions docker or kubernetes\";",
+                  "const mustMatch = \"docker|kubernetes\";",
+                  "const mustNotMatch = \"\";",
+                  "",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const text = (i) => `${i.title} ${i.tags.join(' ')}`.toLowerCase();",
+                  "const { items } = pm.response.json();",
+                  "pm.test(description, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => {",
+                  "    pm.expect(text(i), i.title).to.match(new RegExp(mustMatch));",
+                  "    if (mustNotMatch) pm.expect(text(i), i.title).to.not.match(new RegExp(mustNotMatch));",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=docker or kubernetes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "docker or kubernetes",
+                  "description": "web-search syntax"
+                }
+              ]
+            },
+            "description": "Keywords use web-search syntax: words are ANDed by default, `or` between words matches either, `-word` excludes, and \"quoted phrases\" match in order."
+          },
+          "response": []
+        },
+        {
+          "name": "Exclude a word (-)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const description = \"Every result mentions devops and none mentions docker\";",
+                  "const mustMatch = \"devops\";",
+                  "const mustNotMatch = \"docker\";",
+                  "",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const text = (i) => `${i.title} ${i.tags.join(' ')}`.toLowerCase();",
+                  "const { items } = pm.response.json();",
+                  "pm.test(description, () => {",
+                  "  pm.expect(items.length).to.be.above(0);",
+                  "  items.forEach((i) => {",
+                  "    pm.expect(text(i), i.title).to.match(new RegExp(mustMatch));",
+                  "    if (mustNotMatch) pm.expect(text(i), i.title).to.not.match(new RegExp(mustNotMatch));",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=devops -docker",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "devops -docker",
+                  "description": "web-search syntax"
+                }
+              ]
+            },
+            "description": "The devops items, minus any that mention docker."
+          },
+          "response": []
+        },
+        {
+          "name": "Pagination",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const page2 = pm.response.json();",
+                  "pm.test('Pagination reflects the request', () => {",
+                  "  pm.expect(page2.pagination).to.include({ page: 2, page_size: 3 });",
+                  "  pm.expect(page2.pagination.total_pages).to.equal(Math.ceil(page2.pagination.total / 3));",
+                  "  pm.expect(page2.items.length).to.be.at.most(3);",
+                  "});",
+                  "",
+                  "pm.sendRequest(pm.variables.replaceIn('{{baseUrl}}/api/v1/search?page=1&page_size=3'), (err, res) => {",
+                  "  pm.test('Page 2 continues where page 1 ends', () => {",
+                  "    if (err) throw err;",
+                  "    const page1 = res.json().items;",
+                  "    const onPage1 = new Set(page1.map((i) => i.id));",
+                  "    page2.items.forEach((i) => pm.expect(onPage1.has(i.id), `${i.title} is on both pages`).to.be.false);",
+                  "    if (page2.items.length) {",
+                  "      pm.expect(page1[page1.length - 1].score).to.be.at.least(page2.items[0].score);",
+                  "    }",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page=2&page_size=3",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "2",
+                  "description": "from 1 to 500"
+                },
+                {
+                  "key": "page_size",
+                  "value": "3",
+                  "description": "from 1 to 100"
+                }
+              ]
+            },
+            "description": "The second page of three. The test script also fetches page 1 and checks that the pages line up: no item appears twice, and page 2 picks up where page 1 ends."
+          },
+          "response": []
+        },
+        {
+          "name": "Past the last page",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const { items, pagination } = pm.response.json();",
+                  "pm.test('No items, with the total still reported', () => {",
+                  "  pm.expect(items).to.eql([]);",
+                  "  pm.expect(pagination.page).to.equal(500);",
+                  "  pm.expect(pagination.total).to.be.above(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page=500",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "500",
+                  "description": "the highest page allowed"
+                }
+              ]
+            },
+            "description": "A page beyond the results is empty, not an error, and still reports the total."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Caching",
+      "description": "Search pages are cached in Redis for a minute (`CACHE_TTL`). Keys carry a generation number that ingestion bumps whenever it changes rows, which retires every cached page at once. `meta.cached` says whether a response came from the cache.\n\nRun these three in order, each within a minute of the one before. Without Redis, nothing is cached.",
+      "item": [
+        {
+          "name": "First request: computed",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The page size only gives this run a cache key of its own. Taken from",
+                  "// the clock, it differs between any two runs less than 80 seconds",
+                  "// apart, which covers the one-minute TTL.",
+                  "pm.collectionVariables.set('cachePageSize', 21 + (Math.floor(Date.now() / 1000) % 80));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('Computed by the database (cached: false)', () => {",
+                  "  pm.expect(body.meta.cached, 'run the request again in a minute').to.be.false;",
+                  "});",
+                  "pm.collectionVariables.set('cachedItems', JSON.stringify(body.items));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=docker&page_size={{cachePageSize}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "docker",
+                  "description": "matched against titles and tags"
+                },
+                {
+                  "key": "page_size",
+                  "value": "{{cachePageSize}}",
+                  "description": "picked by the pre-request script"
+                }
+              ]
+            },
+            "description": "The pre-request script picks an unusual page size, so this request starts with an empty cache entry."
+          },
+          "response": []
+        },
+        {
+          "name": "Same request again: cached",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('Served from the cache (cached: true)', () => {",
+                  "  pm.expect(body.meta.cached, 'is Redis up, and did the first request run under a minute ago?').to.be.true;",
+                  "});",
+                  "pm.test('Same results as the first request', () => {",
+                  "  pm.expect(body.items).to.eql(JSON.parse(pm.collectionVariables.get('cachedItems') || 'null'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=docker&page_size={{cachePageSize}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "docker",
+                  "description": "matched against titles and tags"
+                },
+                {
+                  "key": "page_size",
+                  "value": "{{cachePageSize}}",
+                  "description": "same as the first request"
+                }
+              ]
+            },
+            "description": "The same query is answered from Redis."
+          },
+          "response": []
+        },
+        {
+          "name": "Different case: same cache entry",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('Served from the cache (cached: true)', () => {",
+                  "  pm.expect(body.meta.cached, 'is Redis up, and did the first request run under a minute ago?').to.be.true;",
+                  "});",
+                  "pm.test('Same results as the first request', () => {",
+                  "  pm.expect(body.items).to.eql(JSON.parse(pm.collectionVariables.get('cachedItems') || 'null'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q=DOCKER&page_size={{cachePageSize}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "DOCKER",
+                  "description": "case does not matter"
+                },
+                {
+                  "key": "page_size",
+                  "value": "{{cachePageSize}}",
+                  "description": "same as the first request"
+                }
+              ]
+            },
+            "description": "Matching ignores case, so the cache key does too: \"DOCKER\" finds the entry \"docker\" left."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5. Validation and errors",
+      "description": "Errors are RFC 7807 problem documents (`application/problem+json`). Validation reports every problem at once, and each error quotes the request id, which also appears on the server's log lines.",
+      "item": [
+        {
+          "name": "Every problem in one response",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const fields = [\"page\",\"page_size\",\"type\",\"sort\"];",
+                  "",
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test(`Lists the problem with: ${fields.join(', ')}`, () => {",
+                  "  const { errors } = pm.response.json();",
+                  "  pm.expect(errors.map((e) => e.field)).to.have.members(fields);",
+                  "  errors.forEach((e) => pm.expect(e.detail).to.be.a('string').that.is.not.empty);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page=abc&page_size=1000&type=podcast&sort=newest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "abc",
+                  "description": "not a number"
+                },
+                {
+                  "key": "page_size",
+                  "value": "1000",
+                  "description": "over the maximum of 100"
+                },
+                {
+                  "key": "type",
+                  "value": "podcast",
+                  "description": "not a known type"
+                },
+                {
+                  "key": "sort",
+                  "value": "newest",
+                  "description": "not a known sort"
+                }
+              ]
+            },
+            "description": "Four bad parameters, four entries in `errors`. A client can fix them all in one go."
+          },
+          "response": []
+        },
+        {
+          "name": "Relevance needs a keyword",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const fields = [\"sort\"];",
+                  "",
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test(`Lists the problem with: ${fields.join(', ')}`, () => {",
+                  "  const { errors } = pm.response.json();",
+                  "  pm.expect(errors.map((e) => e.field)).to.have.members(fields);",
+                  "  errors.forEach((e) => pm.expect(e.detail).to.be.a('string').that.is.not.empty);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?sort=relevance",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "sort",
+                  "value": "relevance",
+                  "description": "with no q to be relevant to"
+                }
+              ]
+            },
+            "description": "Relevance means how well an item matches `q`, so it cannot be used without one."
+          },
+          "response": []
+        },
+        {
+          "name": "Keyword too long",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('longKeyword', 'a'.repeat(201));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const fields = [\"q\"];",
+                  "",
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test(`Lists the problem with: ${fields.join(', ')}`, () => {",
+                  "  const { errors } = pm.response.json();",
+                  "  pm.expect(errors.map((e) => e.field)).to.have.members(fields);",
+                  "  errors.forEach((e) => pm.expect(e.detail).to.be.a('string').that.is.not.empty);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?q={{longKeyword}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "{{longKeyword}}",
+                  "description": "201 characters, set by the pre-request script"
+                }
+              ]
+            },
+            "description": "Keywords are capped at 200 characters."
+          },
+          "response": []
+        },
+        {
+          "name": "Page out of range",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const fields = [\"page\",\"page_size\"];",
+                  "",
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test(`Lists the problem with: ${fields.join(', ')}`, () => {",
+                  "  const { errors } = pm.response.json();",
+                  "  pm.expect(errors.map((e) => e.field)).to.have.members(fields);",
+                  "  errors.forEach((e) => pm.expect(e.detail).to.be.a('string').that.is.not.empty);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page=501&page_size=101",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "501",
+                  "description": "the maximum is 500"
+                },
+                {
+                  "key": "page_size",
+                  "value": "101",
+                  "description": "the maximum is 100"
+                }
+              ]
+            },
+            "description": "Pages are capped at 500 because Postgres has to read and discard every row an OFFSET skips."
+          },
+          "response": []
+        },
+        {
+          "name": "Unknown API path: JSON 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 404', () => pm.response.to.have.status(404));",
+                  "pm.test('The error names the path', () => {",
+                  "  pm.expect(pm.response.json().detail).to.include('/api/v1/contents');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/contents",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "contents"
+              ]
+            },
+            "description": "Paths under `/api/` that don't exist get a JSON 404, rather than falling through to the dashboard's HTML."
+          },
+          "response": []
+        },
+        {
+          "name": "Your request id is kept",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('The response carries the id that was sent', () => {",
+                  "  pm.expect(pm.response.headers.get('X-Request-Id')).to.equal('postman-walkthrough-1');",
+                  "});",
+                  "pm.test('The error body quotes it too', () => {",
+                  "  pm.expect(pm.response.json().request_id).to.equal('postman-walkthrough-1');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Request-Id",
+                "value": "postman-walkthrough-1",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?type=podcast",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "type",
+                  "value": "podcast",
+                  "description": "invalid, to get an error back"
+                }
+              ]
+            },
+            "description": "A caller (or a proxy in front) can send its own `X-Request-Id`. The server keeps it, so one id follows the request through every system it passes."
+          },
+          "response": []
+        },
+        {
+          "name": "An unsafe request id is replaced",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('A generated id replaced the one sent', () => {",
+                  "  pm.expect(pm.response.headers.get('X-Request-Id')).to.match(/^[A-Z2-7]{16}$/);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Request-Id",
+                "value": "not a valid id!",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/healthz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "Incoming ids are logged, so only letters, digits, `.`, `_` and `-` (up to 64) are accepted. Anything else is replaced with a fresh id, which stops a client from writing arbitrary text into the logs."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6. Docs and dashboard",
+      "description": "The OpenAPI contract, Swagger UI and the React dashboard are all served by the same binary. The dashboard needs building first when you use `go run` (`make dashboard`); the Docker image always has it.",
+      "item": [
+        {
+          "name": "OpenAPI document",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Served as YAML', () => {",
+                  "  pm.expect(pm.response.headers.get('Content-Type')).to.include('application/yaml');",
+                  "});",
+                  "pm.test('Is an OpenAPI 3.1 document describing the search endpoint', () => {",
+                  "  pm.expect(pm.response.text()).to.match(/^openapi: 3\\.1/).and.include('/api/v1/search:');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/openapi.yaml",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openapi.yaml"
+              ]
+            },
+            "description": "The API contract, embedded in the binary."
+          },
+          "response": []
+        },
+        {
+          "name": "Swagger UI",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Loads Swagger UI with the OpenAPI document', () => {",
+                  "  pm.expect(pm.response.text()).to.include('SwaggerUIBundle').and.include('/openapi.yaml');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/docs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "docs"
+              ]
+            },
+            "description": "Open `{{baseUrl}}/docs` in a browser to read the contract and try requests there."
+          },
+          "response": []
+        },
+        {
+          "name": "Dashboard",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Serves the dashboard page', () => {",
+                  "  pm.expect(pm.response.text()).to.include('<div id=\"root\">');",
+                  "});",
+                  "pm.test('index.html is revalidated on every load', () => {",
+                  "  pm.expect(pm.response.headers.get('Cache-Control')).to.equal('no-cache');",
+                  "});",
+                  "",
+                  "const asset = pm.response.text().match(/\\/assets\\/[^\"]+/);",
+                  "pm.test('The page references a bundled asset', () => pm.expect(asset).to.not.be.null);",
+                  "if (asset) {",
+                  "  pm.sendRequest(pm.variables.replaceIn('{{baseUrl}}') + asset[0], (err, res) => {",
+                  "    pm.test(`${asset[0]} is cached for good`, () => {",
+                  "      if (err) throw err;",
+                  "      pm.expect(res.code).to.equal(200);",
+                  "      pm.expect(res.headers.get('Cache-Control')).to.include('immutable');",
+                  "    });",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                ""
+              ]
+            },
+            "description": "Open `{{baseUrl}}` in a browser to use it. `index.html` is revalidated on every load so a deploy shows up at once, while the fingerprinted files under `/assets/` are cached for good."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "7. Rate limiting (run last)",
+      "description": "Searches are limited per client IP: 120 a minute by default (`RATE_LIMIT_PER_MINUTE`). The counters live in Redis, so every instance shares one budget. If Redis is down, requests are let through rather than refused.\n\nThe first request here uses up your budget on purpose; the second waits until it resets. Together they take up to a minute.",
+      "item": [
+        {
+          "name": "Use up the budget: 429",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const MAX_REQUESTS = 500; // past this, the limiter is clearly off",
+                  "const url = pm.variables.replaceIn('{{baseUrl}}/api/v1/search?page_size=1');",
+                  "",
+                  "const send = (count) => pm.sendRequest(url, (err, res) => {",
+                  "  if (!err && res.code !== 429 && count < MAX_REQUESTS) {",
+                  "    send(count + 1);",
+                  "    return;",
+                  "  }",
+                  "  pm.test(`Refused after ${count} more requests`, () => {",
+                  "    if (err) throw err;",
+                  "    pm.expect(res.code, 'no 429: is Redis up and RATE_LIMIT_PER_MINUTE above 0?').to.equal(429);",
+                  "    pm.expect(res.json().detail).to.include('too many requests');",
+                  "",
+                  "    const retryAfter = Number(res.headers.get('Retry-After'));",
+                  "    pm.expect(retryAfter, 'Retry-After').to.be.within(1, 60);",
+                  "    pm.collectionVariables.set('retryAfter', retryAfter);",
+                  "  });",
+                  "});",
+                  "send(1);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page_size=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page_size",
+                  "value": "1",
+                  "description": "kept small, since this is sent many times"
+                }
+              ]
+            },
+            "description": "After this request, the test script keeps searching until the limiter says no, then checks the 429: a problem document and a `Retry-After` header saying when to come back."
+          },
+          "response": []
+        },
+        {
+          "name": "After Retry-After: allowed again",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const seconds = Number(pm.collectionVariables.get('retryAfter')) || 0;",
+                  "pm.collectionVariables.set('retryAfter', '');",
+                  "if (seconds > 0) {",
+                  "  console.log(`Waiting ${seconds}s for the rate-limit window to reset`);",
+                  "  setTimeout(() => {}, seconds * 1000);",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/search?page_size=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "page_size",
+                  "value": "1",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "The pre-request script waits exactly as long as `Retry-After` said, then this search goes through, because the limiter uses fixed one-minute windows."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,291 @@
+openapi: 3.1.0
+info:
+  title: Feedrank API
+  version: 1.0.0
+  description: |
+    Searches content collected from two providers (one JSON, one XML) and
+    ranks it with the scoring formula:
+
+        final = base × type_coefficient + engagement + recency
+
+    | | Video | Text |
+    | --- | --- | --- |
+    | base | views/1000 + likes/100 | reading_time + reactions/50 |
+    | type_coefficient | 1.5 | 1.0 |
+    | engagement | (likes/views) × 10 | (reactions/reading_time) × 5 |
+
+    Recency adds 5 within a week, 3 within a month, 1 within three months and
+    0 after that. It is computed when the query runs, so scores never go stale.
+
+    Errors are RFC 7807 problem documents.
+
+tags:
+  - name: Search
+  - name: Admin
+  - name: Health
+
+paths:
+  /api/v1/search:
+    get:
+      tags: [Search]
+      summary: Search content
+      operationId: searchContent
+      description: |
+        Returns one page of content. Without `q` it lists everything. Repeated
+        queries are served from a cache for up to a minute, or until the next
+        ingestion changes the data.
+      parameters:
+        - name: q
+          in: query
+          description: |
+            Keywords matched against titles and tags. Accepts quoted phrases,
+            `or` and `-word`. Matching ignores case and accents and treats the
+            Turkish İ/ı as i, so `istanbul` finds "İstanbul". Words of three
+            or more letters also match as prefixes, so `begin` finds
+            "Beginners".
+          schema: { type: string, maxLength: 200 }
+          example: docker
+        - name: type
+          in: query
+          description: Only return this content type.
+          schema: { type: string, enum: [video, text] }
+        - name: sort
+          in: query
+          description: |
+            `popularity` orders by final score. `relevance` orders by how well
+            the item matches `q`, then by score, and needs `q`. Defaults to
+            `relevance` when `q` is set and `popularity` otherwise.
+          schema: { type: string, enum: [popularity, relevance] }
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: A page of results.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/ingest:
+    post:
+      tags: [Admin]
+      summary: Run ingestion now
+      operationId: runIngestion
+      description: |
+        Fetches every provider and stores what changed. Ingestion also runs on
+        start-up and every five minutes, so this is only needed to refresh on
+        demand. Only one run happens at a time across all instances. The
+        endpoint is disabled unless `ADMIN_API_KEY` is set.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: |
+            The run finished. A provider that failed is reported with an
+            `error`; the others are stored regardless.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Another run is in progress.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness
+      description: The process is up. Checks no dependencies.
+      operationId: liveness
+      responses:
+        "200":
+          description: Alive.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness
+      description: The instance can reach the database and serve traffic.
+      operationId: readiness
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "503":
+          description: The database is unreachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  responses:
+    BadRequest:
+      description: The query is invalid. Every problem is listed in `errors`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+          example:
+            type: about:blank
+            title: Bad Request
+            status: 400
+            detail: invalid search query
+            errors:
+              - { field: page, detail: must be an integer }
+              - { field: type, detail: must be video or text }
+            request_id: 6f1c2a9d0b3e4f57
+    Unauthorized:
+      description: The X-API-Key header is missing or wrong.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooManyRequests:
+      description: The client has used its request budget. See `Retry-After`.
+      headers:
+        Retry-After:
+          description: Seconds until the budget resets.
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    InternalError:
+      description: Something failed on our side. Details are logged under `request_id`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    SearchResponse:
+      type: object
+      required: [items, pagination, meta]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Content" }
+        pagination:
+          type: object
+          required: [page, page_size, total, total_pages]
+          properties:
+            page: { type: integer, example: 1 }
+            page_size: { type: integer, example: 20 }
+            total: { type: integer, description: Matches across all pages., example: 8 }
+            total_pages: { type: integer, example: 1 }
+        meta:
+          type: object
+          required: [sort, cached]
+          properties:
+            sort:
+              type: string
+              enum: [popularity, relevance]
+              description: The order that was applied.
+            cached:
+              type: boolean
+              description: Whether the page was served from the cache.
+
+    Content:
+      type: object
+      required: [id, provider, external_id, title, content_type, tags, published_at, metrics, score, score_breakdown]
+      properties:
+        id: { type: integer, example: 8 }
+        provider: { type: string, example: provider2 }
+        external_id:
+          type: string
+          description: The provider's own id. Unique only within that provider.
+          example: a1
+        title: { type: string, example: Cast Iron Care Guide }
+        content_type: { type: string, enum: [video, text] }
+        tags:
+          type: array
+          items: { type: string }
+          example: [programming, architecture]
+        published_at: { type: string, format: date-time, example: "2024-03-14T00:00:00Z" }
+        metrics:
+          type: object
+          description: Videos carry views and likes; text carries reading_time (minutes) and reactions.
+          properties:
+            views: { type: integer }
+            likes: { type: integer }
+            reading_time: { type: integer, example: 8 }
+            reactions: { type: integer, example: 450 }
+        score:
+          type: number
+          description: The final score. Same as score_breakdown.final.
+          example: 298.25
+        score_breakdown:
+          type: object
+          required: [base, type_coefficient, engagement, recency, final]
+          properties:
+            base: { type: number, example: 17 }
+            type_coefficient: { type: number, example: 1 }
+            engagement: { type: number, example: 281.25 }
+            recency: { type: number, example: 0 }
+            final: { type: number, example: 298.25 }
+        relevance:
+          type: number
+          description: Full-text rank between 0 and 1. Only present for keyword searches.
+
+    IngestResponse:
+      type: object
+      required: [providers]
+      properties:
+        providers:
+          type: array
+          items:
+            type: object
+            required: [provider, fetched, rejected, changed, duration_ms]
+            properties:
+              provider: { type: string, example: provider1 }
+              fetched: { type: integer, description: Items that passed validation., example: 4 }
+              rejected: { type: integer, description: Items left out as invalid; see the logs., example: 0 }
+              changed: { type: integer, description: Rows inserted or updated., example: 4 }
+              duration_ms: { type: integer, example: 412 }
+              error: { type: string, description: Why this provider failed, if it did. }
+
+    Status:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+
+    Problem:
+      type: object
+      description: An RFC 7807 problem document.
+      required: [type, title, status, detail]
+      properties:
+        type: { type: string, example: about:blank }
+        title: { type: string, example: Bad Request }
+        status: { type: integer, example: 400 }
+        detail: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, detail]
+            properties:
+              field: { type: string }
+              detail: { type: string }
+        request_id:
+          type: string
+          description: Also returned as the X-Request-Id header and attached to every log line for the request.

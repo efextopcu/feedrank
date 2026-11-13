@@ -3,10 +3,14 @@
 package postgres_test
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,6 +189,111 @@ func TestPopularityMatchesTheFormula(t *testing.T) {
 	// The ancient article still wins: its engagement term is 450/8 × 5.
 	if r.Items[0].ExternalID != "old-text" {
 		t.Errorf("top result = %s, want old-text", r.Items[0].ExternalID)
+	}
+}
+
+// Popularity order ranks a candidate window, not every match. The window must
+// never change the answer: every page has to match a full sort done in Go,
+// with and without filters. Scores are packed within a few points of each
+// other and ages are spread over every recency tier, so recency reorders a
+// lot of rows.
+func TestPopularityWindowMatchesAFullSort(t *testing.T) {
+	s := newStore(t)
+	rng := rand.New(rand.NewPCG(1, 2))
+	ages := []time.Duration{24 * time.Hour, 10 * 24 * time.Hour, 60 * 24 * time.Hour, 400 * 24 * time.Hour}
+
+	var items []domain.Content
+	titles := []string{"Garden notes", "Kitchen notes"}
+	for i := range 300 {
+		age, title := ages[rng.IntN(len(ages))], titles[rng.IntN(len(titles))]
+		if i%2 == 0 {
+			items = append(items, item("p", fmt.Sprintf("v%03d", i), title, domain.Video, age,
+				domain.Metrics{Views: 1000 + rng.Int64N(3000), Likes: rng.Int64N(50)}))
+		} else {
+			items = append(items, item("p", fmt.Sprintf("t%03d", i), title, domain.Text, age,
+				domain.Metrics{ReadingTime: 1 + rng.Int64N(4), Reactions: rng.Int64N(10)}))
+		}
+	}
+	upsert(t, s, items...) // ids follow this order, which breaks ties
+
+	expected := func(typ domain.ContentType, keyword string) []string {
+		type ranked struct {
+			id    string
+			final float64
+			seq   int
+		}
+		var all []ranked
+		for i, c := range items {
+			if (typ == "" || c.Type == typ) && (keyword == "" || strings.HasPrefix(strings.ToLower(c.Title), keyword)) {
+				all = append(all, ranked{c.ExternalID, c.Score.Final + scoring.Recency(c.PublishedAt, now), i})
+			}
+		}
+		slices.SortFunc(all, func(a, b ranked) int {
+			return cmp.Or(cmp.Compare(b.final, a.final), cmp.Compare(a.seq, b.seq))
+		})
+		out := make([]string, len(all))
+		for i, r := range all {
+			out[i] = r.id
+		}
+		return out
+	}
+
+	filters := []struct {
+		typ     domain.ContentType
+		keyword string
+	}{{"", ""}, {domain.Video, ""}, {domain.Text, ""}, {"", "garden"}, {domain.Text, "kitchen"}}
+
+	for _, f := range filters {
+
+		want := expected(f.typ, f.keyword)
+		for _, size := range []int{1, 7, 20, 100} {
+			var got []string
+			for page := 1; ; page++ {
+				r := search(t, s, domain.SearchQuery{
+					Keyword: f.keyword, Type: f.typ, Sort: domain.SortPopularity, Page: page, PageSize: size,
+				})
+				if r.Total != len(want) {
+					t.Fatalf("type %q, keyword %q: total %d, want %d", f.typ, f.keyword, r.Total, len(want))
+				}
+				if len(r.Items) == 0 {
+					break
+				}
+				got = append(got, ids(r)...)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("type %q, keyword %q, page size %d: the windowed order differs from a full sort",
+					f.typ, f.keyword, size)
+			}
+		}
+	}
+}
+
+// Ingestion stores a feed one page per transaction. A run over many pages has
+// to land every row, and running it again must change nothing.
+func TestUpsertingManyPages(t *testing.T) {
+	s := newStore(t)
+	const pages, perPage = 50, 200
+
+	run := func() (changed int) {
+		for p := range pages {
+			batch := make([]domain.Content, 0, perPage)
+			for i := range perPage {
+				batch = append(batch, item("p", fmt.Sprintf("%d-%d", p, i), "Item", domain.Video, time.Hour,
+					domain.Metrics{Views: int64(i * 10), Likes: int64(i)}))
+			}
+			changed += upsert(t, s, batch...)
+		}
+		return changed
+	}
+
+	if got := run(); got != pages*perPage {
+		t.Fatalf("first run changed %d rows, want %d", got, pages*perPage)
+	}
+	if got := run(); got != 0 {
+		t.Fatalf("an identical second run changed %d rows, want 0", got)
+	}
+	if r := search(t, s, domain.SearchQuery{}); r.Total != pages*perPage {
+		t.Fatalf("total = %d, want %d", r.Total, pages*perPage)
 	}
 }
 

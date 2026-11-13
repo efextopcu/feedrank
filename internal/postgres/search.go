@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,11 +29,13 @@ const keywordQuery = `regexp_replace(
 // Search returns one page of results, scored as of now.
 //
 // Every value reaches Postgres as a bound parameter. The only SQL built from
-// code is the recency CASE, which comes from scoring's own tiers.
+// code is the recency CASE, which comes from scoring's own tiers, and the
+// constant keyword query above.
 //
-// Ordering by final score means sorting the matching rows, since recency is
-// added per query and an index on the stored score cannot provide the order.
-// That is cheap at this size; the README covers what to do as the table grows.
+// Popularity order ranks only a window of candidates read from the
+// stored-score index (see popularityCutoff), so it stays fast however many
+// rows match. Relevance order has to rank every match by text relevance; the
+// GIN index narrows those down first.
 func (s *Store) Search(ctx context.Context, q domain.SearchQuery, now time.Time) (domain.SearchResult, error) {
 	result := domain.SearchResult{Page: q.Page, PageSize: q.PageSize}
 
@@ -61,6 +64,13 @@ func (s *Store) Search(ctx context.Context, q domain.SearchQuery, now time.Time)
 	if q.Offset() >= result.Total {
 		return result, nil
 	}
+	if k := q.Offset() + q.PageSize; q.Sort == domain.SortPopularity && result.Total > k {
+		cutoff, err := s.popularityCutoff(ctx, filter, args, k)
+		if err != nil {
+			return domain.SearchResult{}, err
+		}
+		filter += " AND c.static_score >= " + arg(cutoff)
+	}
 
 	recency := recencySQL(now, arg)
 	order := "final DESC, c.id"
@@ -87,6 +97,31 @@ func (s *Store) Search(ctx context.Context, q domain.SearchQuery, now time.Time)
 		return domain.SearchResult{}, fmt.Errorf("reading search results: %w", err)
 	}
 	return result, nil
+}
+
+// popularityCutoff returns the lowest stored score a row can have and still
+// reach the first k places by popularity, so the query ranks a window of
+// candidates instead of every match.
+//
+// final = static + recency, and recency adds between 0 and MaxRecency points.
+// Let T be the k-th highest static score among the matches. Those k rows all
+// have final >= T. A row whose static score is below T - MaxRecency has
+// final < T, so at least k rows rank above it and it cannot be in the first k
+// places. Keeping every row with static >= T - MaxRecency is therefore exact,
+// not an approximation, whatever the data looks like.
+//
+// T is looked up on its own, rather than as a subquery, so the planner sees
+// the actual value and reads the candidates as an index range. The margin is
+// a hair over MaxRecency, so floating-point rounding in static + recency can
+// never drop a row that ties. Call it only when more than k rows match.
+func (s *Store) popularityCutoff(ctx context.Context, filter string, args []any, k int) (float64, error) {
+	query := "SELECT c.static_score FROM " + filter +
+		" ORDER BY c.static_score DESC OFFSET $" + strconv.Itoa(len(args)+1) + " LIMIT 1"
+	var kth float64
+	if err := s.pool.QueryRow(ctx, query, append(slices.Clone(args), k-1)...).Scan(&kth); err != nil {
+		return 0, fmt.Errorf("finding the popularity cutoff: %w", err)
+	}
+	return kth - scoring.MaxRecency() - 1e-6, nil
 }
 
 // recencySQL renders scoring's recency tiers as a CASE over published_at.

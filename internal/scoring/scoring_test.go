@@ -101,3 +101,9 @@ func closeScore(a, b domain.Score) bool {
 	return near(a.Base, b.Base) && near(a.TypeCoefficient, b.TypeCoefficient) &&
 		near(a.Engagement, b.Engagement) && near(a.Recency, b.Recency) && near(a.Final, b.Final)
 }
+
+func TestMaxRecency(t *testing.T) {
+	if got := scoring.MaxRecency(); got != 5 {
+		t.Errorf("MaxRecency() = %v, want 5", got)
+	}
+}

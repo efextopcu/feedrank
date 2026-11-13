@@ -43,6 +43,15 @@ var recencyTiers = []Tier{
 // the last tier scores zero.
 func RecencyTiers() []Tier { return slices.Clone(recencyTiers) }
 
+// MaxRecency is the most recency can add to a score.
+func MaxRecency() float64 {
+	best := 0.0
+	for _, t := range recencyTiers {
+		best = max(best, t.Points)
+	}
+	return best
+}
+
 // Static returns every term of the score except recency, which is left at
 // zero. Final is therefore the score of an item too old to earn recency points.
 func Static(c domain.Content) domain.Score {

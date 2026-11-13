@@ -37,8 +37,10 @@ services:
       DATABASE_URL: postgres://search:search@postgres:5432/search?sslmode=disable
       REDIS_ADDR: redis:6379
       ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key}
-      PROVIDER1_URL: ${PROVIDER1_URL:?set PROVIDER1_URL in .env, see .env.example}
-      PROVIDER2_URL: ${PROVIDER2_URL:?set PROVIDER2_URL in .env, see .env.example}
+      # Required by the app, which refuses to start without them. They are not
+      # enforced here, or even `docker compose down` would demand them.
+      PROVIDER1_URL: ${PROVIDER1_URL:-}
+      PROVIDER2_URL: ${PROVIDER2_URL:-}
       # Optional tuning from .env; an empty value means the app's default.
       INGEST_INTERVAL: ${INGEST_INTERVAL:-}
       INGEST_TIMEOUT: ${INGEST_TIMEOUT:-}

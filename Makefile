@@ -11,6 +11,8 @@ help: ## List the targets
 
 .PHONY: up
 up: ## Build and start the stack (Postgres, Redis, app) on :8080
+	@test -n "$(PROVIDER1_URL)" -a -n "$(PROVIDER2_URL)" || \
+		{ echo "Set PROVIDER1_URL and PROVIDER2_URL in .env first (see .env.example)."; exit 1; }
 	docker compose up --build -d
 	@echo "dashboard  http://localhost:8080"
 	@echo "API docs   http://localhost:8080/docs"

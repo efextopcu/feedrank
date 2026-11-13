@@ -10,7 +10,7 @@ import (
 )
 
 // keyPrefix namespaces every key, so the service can share a Redis instance.
-const keyPrefix = "search-api:"
+const keyPrefix = "feedrank:"
 
 // NewClient returns a client with short timeouts and no retries. Redis sits
 // on the request path, so a slow or missing Redis should turn into a quick

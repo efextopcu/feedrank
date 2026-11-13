@@ -1,0 +1,61 @@
+.DEFAULT_GOAL := help
+
+# .env (see .env.example) also applies to the targets that run Go directly.
+-include .env
+export PROVIDER1_URL PROVIDER2_URL
+ADMIN_API_KEY ?= dev-admin-key
+
+.PHONY: help
+help: ## List the targets
+	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+.PHONY: up
+up: ## Build and start the stack (Postgres, Redis, app) on :8080
+	docker compose up --build -d
+	@echo "dashboard  http://localhost:8080"
+	@echo "API docs   http://localhost:8080/docs"
+
+.PHONY: down
+down: ## Stop the stack
+	docker compose down --remove-orphans
+
+.PHONY: clean
+clean: ## Stop the stack and delete its data
+	docker compose down -v --remove-orphans
+
+.PHONY: logs
+logs: ## Follow the app's logs
+	docker compose logs -f app
+
+.PHONY: ingest
+ingest: ## Run ingestion now on the running stack
+	@curl -fsS -X POST -H "X-API-Key: $(ADMIN_API_KEY)" localhost:8080/api/v1/ingest; echo
+
+.PHONY: postman
+postman: ## Run the Postman walkthrough against the running stack (needs Node)
+	npx --yes newman@6.2.3 run postman/feedrank.postman_collection.json --env-var apiKey=$(ADMIN_API_KEY)
+
+.PHONY: run
+run: ## Run the server locally against the Compose Postgres and Redis
+	docker compose up -d postgres redis
+	REDIS_ADDR=localhost:6379 ADMIN_API_KEY=$(ADMIN_API_KEY) go run ./cmd/server
+
+.PHONY: dashboard
+dashboard: ## Build the dashboard so `go run` can serve it
+	cd web/dashboard && npm ci --no-audit --no-fund && npm run build && touch dist/.gitkeep
+
+.PHONY: test
+test: ## Unit tests
+	go test -race ./...
+
+.PHONY: test-integration
+test-integration: ## Unit and Postgres integration tests (needs Docker)
+	go test -race -tags integration ./...
+
+.PHONY: test-live
+test-live: ## Check the real provider endpoints still match the decoders
+	go test -tags live -run Live -v ./internal/provider/
+
+.PHONY: lint
+lint: ## golangci-lint
+	golangci-lint run ./...

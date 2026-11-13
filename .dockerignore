@@ -1,0 +1,7 @@
+.git
+.github
+bin
+.env
+web/dashboard/node_modules
+web/dashboard/dist
+postman

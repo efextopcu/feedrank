@@ -1,0 +1,33 @@
+version: "2"
+
+run:
+  build-tags: [integration, live]
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+  exclusions:
+    presets: [std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [bodyclose, noctx, errcheck]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [feedrank]

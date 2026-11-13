@@ -1,0 +1,13 @@
+/bin/
+coverage.out
+.env
+
+web/dashboard/node_modules/
+# The dashboard build is generated. The directory is kept because go:embed
+# needs it to exist; the server says so when it is empty.
+web/dashboard/dist/*
+!web/dashboard/dist/.gitkeep
+
+.DS_Store
+.idea/
+.vscode/

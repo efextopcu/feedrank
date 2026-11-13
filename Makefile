@@ -4,18 +4,19 @@
 -include .env
 export PROVIDER1_URL PROVIDER2_URL
 ADMIN_API_KEY ?= dev-admin-key
+APP_PORT ?= 8080
 
 .PHONY: help
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: up
-up: ## Build and start the stack (Postgres, Redis, app) on :8080
+up: ## Build and start the stack (Postgres, Redis, app), on :8080 unless APP_PORT says otherwise
 	@test -n "$(PROVIDER1_URL)" -a -n "$(PROVIDER2_URL)" || \
 		{ echo "Set PROVIDER1_URL and PROVIDER2_URL in .env first (see .env.example)."; exit 1; }
 	docker compose up --build -d
-	@echo "dashboard  http://localhost:8080"
-	@echo "API docs   http://localhost:8080/docs"
+	@echo "dashboard  http://localhost:$(APP_PORT)"
+	@echo "API docs   http://localhost:$(APP_PORT)/docs"
 
 .PHONY: down
 down: ## Stop the stack
@@ -31,11 +32,11 @@ logs: ## Follow the app's logs
 
 .PHONY: ingest
 ingest: ## Run ingestion now on the running stack
-	@curl -fsS -X POST -H "X-API-Key: $(ADMIN_API_KEY)" localhost:8080/api/v1/ingest; echo
+	@curl -fsS -X POST -H "X-API-Key: $(ADMIN_API_KEY)" localhost:$(APP_PORT)/api/v1/ingest; echo
 
 .PHONY: postman
 postman: ## Run the Postman walkthrough against the running stack (needs Node)
-	npx --yes newman@6.2.3 run postman/feedrank.postman_collection.json --env-var apiKey=$(ADMIN_API_KEY)
+	npx --yes newman@6.2.3 run postman/feedrank.postman_collection.json --env-var apiKey=$(ADMIN_API_KEY) --env-var baseUrl=http://localhost:$(APP_PORT)
 
 .PHONY: run
 run: ## Run the server locally against the Compose Postgres and Redis
